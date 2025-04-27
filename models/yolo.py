@@ -25,6 +25,7 @@ if str(ROOT) not in sys.path:
 if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
+from models.tood import TOODHead
 from models.common import (
     C3,
     C3SPP,
@@ -207,7 +208,7 @@ class BaseModel(nn.Module):
         """
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment, TOODHead)):
             m.stride = fn(m.stride)
             m.grid = list(map(fn, m.grid))
             if isinstance(m.anchor_grid, list):
@@ -244,7 +245,7 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        if isinstance(m, (Detect, Segment, TOODHead)):
 
             def _forward(x):
                 """Passes the input 'x' through the model and returns the processed output."""
@@ -315,20 +316,22 @@ class DetectionModel(BaseModel):
         return y
 
     def _initialize_biases(self, cf=None):
-        """
-        Initializes biases for YOLOv5's Detect() module, optionally using class frequencies (cf).
-
-        For details see https://arxiv.org/abs/1708.02002 section 3.3.
-        """
-        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-1]  # Detect() module
-        for mi, s in zip(m.m, m.stride):  # from
-            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
-            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
-            b.data[:, 5 : 5 + m.nc] += (
-                math.log(0.6 / (m.nc - 0.99999)) if cf is None else torch.log(cf / cf.sum())
-            )  # cls
-            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        m = self.model[-1]  # Get the head (TOODHead/Detect)
+        
+        if isinstance(m, Detect):  # Original YOLOv5 head
+            for mi, s in zip(m.m, m.stride):
+                # Original bias init
+                b = mi.bias.view(m.na, -1)
+                b.data[:, 4] += math.log(8 / (640 / s) ** 2)
+                b.data[:, 5:5+m.nc] += math.log(0.6 / (m.nc - 0.99999))
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+                
+        elif isinstance(m, TOODHead):  # Custom TOOD head
+            # Initialize biases differently if needed
+            for conv in m.m:
+                b = conv.bias.view(m.na, -1)
+                b.data.fill_(-math.log(0.99 / (1 - 0.99)))  # Default objectness
+                conv.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
 
 Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
@@ -434,7 +437,7 @@ def parse_model(d, ch):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
-        elif m in {Detect, Segment}:
+        elif m in {Detect, Segment, TOODHead}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
