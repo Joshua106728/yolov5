@@ -44,7 +44,7 @@ def align_b(B_box, O):
     B_batch, C, H, W = B_box.shape # (B, 4, H, W)
     device = B_box.device
 
-    # Compute pixel grid
+    # Compute pixel grid - FIXED: Use device from input tensor
     yv, xv = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
     grid = torch.stack((xv, yv), dim=0).float() # (2, H, W)
 
@@ -81,7 +81,7 @@ def distances_to_bboxes(distances, stride):
     B, C, H, W = distances.shape
     device = distances.device
 
-    # Get (x, y) grid centers in feature map
+    # FIXED: Create grid on the same device as input tensor
     grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
     grid_x = grid_x.float() * stride  # [H, W]
     grid_y = grid_y.float() * stride
@@ -266,7 +266,7 @@ class TOODHead(nn.Module):
         # Set strides for localization branches
         if not self.training and isinstance(self.stride, torch.Tensor):
             for i in range(self.nl):
-                self.reg_tap[i].stride = self.stride[i]
+                self.reg_tap[i].stride = self.stride[i].to(self.reg_tap[i].stride.device)
         
         # Handle both list and tensor inputs
         if isinstance(x, (list, tuple)):
@@ -284,9 +284,9 @@ class TOODHead(nn.Module):
             out = self.process_level(x, 0)
             return out.view(out.shape[0], -1, self.no) if not self.training else out
         
-    def _make_grid(self, nx, ny):
-        """Original YOLOv5 grid generation, no level_idx needed"""
-        yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing='ij')
+    def _make_grid(self, nx, ny, device):
+        """Modified grid generation with device parameter"""
+        yv, xv = torch.meshgrid(torch.arange(ny, device=device), torch.arange(nx, device=device), indexing='ij')
         return torch.stack((xv, yv), 2).view(1, 1, ny, nx, 2).float()
         
     def process_level(self, x, level_idx):
@@ -316,9 +316,10 @@ class TOODHead(nn.Module):
         yolo_output = yolo_output.view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
         if not self.training:
-            if self.grid[level_idx].shape[2:4] != yolo_output.shape[2:4]:
-                self.grid[level_idx] = self._make_grid(nx, ny)  # Removed level_idx
-                self.anchor_grid[level_idx] = self.anchors[level_idx].view(1, -1, 1, 1, 2)
+            device = yolo_output.device
+            if self.grid[level_idx].shape[2:4] != yolo_output.shape[2:4] or self.grid[level_idx].device != device:
+                self.grid[level_idx] = self._make_grid(nx, ny, device)  # Added device parameter
+                self.anchor_grid[level_idx] = self.anchors[level_idx].to(device).view(1, -1, 1, 1, 2)
 
             y = yolo_output.sigmoid()
             y[..., 0:2] = (y[..., 0:2] * 2 - 0.5 + self.grid[level_idx]) * self.stride[level_idx]  # xy
@@ -328,5 +329,3 @@ class TOODHead(nn.Module):
             return y.view(y.shape[0], -1, self.no)
 
         return yolo_output
-
-        

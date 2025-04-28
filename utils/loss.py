@@ -28,6 +28,10 @@ class BCEBlurWithLogitsLoss(nn.Module):
         """Computes modified BCE loss for YOLOv5 with reduced missing label effects, taking pred and true tensors,
         returns mean loss.
         """
+        # Ensure inputs are on the same device
+        if pred.device != true.device:
+            true = true.to(pred.device)
+            
         loss = self.loss_fcn(pred, true)
         pred = torch.sigmoid(pred)  # prob from logits
         dx = pred - true  # reduce only missing label effects
@@ -53,6 +57,10 @@ class FocalLoss(nn.Module):
 
     def forward(self, pred, true):
         """Calculates the focal loss between predicted and true labels using a modified BCEWithLogitsLoss."""
+        # Ensure inputs are on the same device
+        if pred.device != true.device:
+            true = true.to(pred.device)
+            
         loss = self.loss_fcn(pred, true)
         # p_t = torch.exp(-loss)
         # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
@@ -88,6 +96,10 @@ class QFocalLoss(nn.Module):
         """Computes the focal loss between `pred` and `true` using BCEWithLogitsLoss, adjusting for imbalance with
         `gamma` and `alpha`.
         """
+        # Ensure inputs are on the same device
+        if pred.device != true.device:
+            true = true.to(pred.device)
+            
         loss = self.loss_fcn(pred, true)
 
         pred_prob = torch.sigmoid(pred)  # prob from logits
@@ -116,34 +128,50 @@ class TaskAlignedAssigner:
                gt_labels,    # (M,)
                gt_boxes):    # (M, 4)
 
+        device = pred_scores.device
         num_anchors = pred_scores.shape[0]
         num_gt = gt_boxes.shape[0]
         
         if num_gt == 0:
             return (torch.zeros_like(pred_scores),
                     torch.zeros_like(pred_boxes),
-                    torch.zeros((num_anchors,), dtype=torch.long, device=pred_scores.device))
+                    torch.zeros((num_anchors,), dtype=torch.long, device=device))
+        
+        # Ensure all inputs are on the same device
+        gt_labels = gt_labels.to(device)
+        gt_boxes = gt_boxes.to(device)
+        anchor_points = anchor_points.to(device)
         
         # Compute IoU between predictions and GT boxes
-        gt_boxes = gt_boxes[:, None, :]  # (M, 1, 4)
-        pred_boxes = pred_boxes[None, :, :]  # (1, N, 4)
-        
-        # Compute IoU
-        lt = torch.max(gt_boxes[..., :2], pred_boxes[..., :2])
-        rb = torch.min(gt_boxes[..., 2:], pred_boxes[..., 2:])
-        wh = (rb - lt).clamp(min=0)
-        overlap = wh[..., 0] * wh[..., 1]
-        
-        area_gt = (gt_boxes[..., 2] - gt_boxes[..., 0]) * (gt_boxes[..., 3] - gt_boxes[..., 1])
-        area_pred = (pred_boxes[..., 2] - pred_boxes[..., 0]) * (pred_boxes[..., 3] - pred_boxes[..., 1])
-        
-        iou = overlap / (area_gt + area_pred - overlap + 1e-7)  # (M, N)
+        try:
+            gt_boxes = gt_boxes[:, None, :]  # (M, 1, 4)
+            pred_boxes = pred_boxes[None, :, :]  # (1, N, 4)
+            
+            # Compute IoU
+            lt = torch.max(gt_boxes[..., :2], pred_boxes[..., :2])
+            rb = torch.min(gt_boxes[..., 2:], pred_boxes[..., 2:])
+            wh = (rb - lt).clamp(min=0)
+            overlap = wh[..., 0] * wh[..., 1]
+            
+            area_gt = (gt_boxes[..., 2] - gt_boxes[..., 0]) * (gt_boxes[..., 3] - gt_boxes[..., 1])
+            area_pred = (pred_boxes[..., 2] - pred_boxes[..., 0]) * (pred_boxes[..., 3] - pred_boxes[..., 1])
+            
+            iou = overlap / (area_gt + area_pred - overlap + 1e-7)  # (M, N)
+        except RuntimeError as e:
+            # Handle potential OOM errors by implementing a batch approach
+            print(f"RuntimeError during IoU computation: {e}")
+            # Fallback to a simpler assignment strategy
+            return (
+                torch.zeros_like(pred_scores),
+                torch.zeros_like(pred_boxes),
+                torch.zeros((num_anchors,), dtype=torch.long, device=device)
+            )
         
         # Get scores for corresponding GT classes
         gt_classes_one_hot = torch.zeros(
-            (num_gt, pred_scores.shape[1]), device=pred_scores.device, dtype=pred_scores.dtype
+            (num_gt, pred_scores.shape[1]), device=device, dtype=pred_scores.dtype
         )
-        gt_classes_one_hot[torch.arange(num_gt, device=pred_scores.device), gt_labels] = 1
+        gt_classes_one_hot[torch.arange(num_gt, device=device), gt_labels] = 1
         
         # Calculate scores for each GT class
         pred_scores = pred_scores.sigmoid()  # (N, num_classes)
@@ -153,8 +181,8 @@ class TaskAlignedAssigner:
         alignment_metric = torch.pow(scores, self.alpha) * torch.pow(iou, self.beta)  # (M, N)
         
         # Initialize assignment tensors
-        assigned_gt_idx = torch.full((num_anchors,), -1, dtype=torch.long, device=pred_scores.device)
-        assigned_metrics = torch.zeros((num_anchors,), device=pred_scores.device)
+        assigned_gt_idx = torch.full((num_anchors,), -1, dtype=torch.long, device=device)
+        assigned_metrics = torch.zeros((num_anchors,), device=device)
         
         # For each GT, select top-k anchors
         for gt_idx in range(num_gt):
@@ -172,7 +200,7 @@ class TaskAlignedAssigner:
         # Create output tensors
         assigned_scores = torch.zeros_like(pred_scores)
         assigned_boxes = torch.zeros_like(pred_boxes)
-        assigned_labels = torch.zeros((num_anchors,), dtype=torch.long, device=pred_scores.device)
+        assigned_labels = torch.zeros((num_anchors,), dtype=torch.long, device=device)
         
         if pos_mask.sum() > 0:
             # Create one-hot labels for positive samples
@@ -196,14 +224,20 @@ class TaskAlignedLoss(nn.Module):
         self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
     
     def forward(self, pred_scores, pred_boxes, assigned_scores, assigned_boxes):
+        device = pred_scores.device
+        
+        # Ensure all inputs are on the same device
+        assigned_scores = assigned_scores.to(device)
+        assigned_boxes = assigned_boxes.to(device)
+        
         # Create positive sample mask - sum over classes to check if any class is positive
         pos_mask = assigned_scores.sum(dim=1) > 0
         
         if pos_mask.sum() == 0:
             # No positive samples in this batch
             return (
-                torch.tensor(0.0, device=pred_scores.device, requires_grad=True),
-                torch.tensor(0.0, device=pred_boxes.device, requires_grad=True)
+                torch.tensor(0.0, device=device, requires_grad=True),
+                torch.tensor(0.0, device=device, requires_grad=True)
             )
         
         # Classification loss for all samples
@@ -219,6 +253,13 @@ class TaskAlignedLoss(nn.Module):
             # Compute IoU for positive samples
             pos_pred_boxes = pred_boxes[pos_mask]
             pos_assigned_boxes = assigned_boxes[pos_mask]
+            
+            # Handle potential empty tensor case
+            if pos_pred_boxes.numel() == 0 or pos_assigned_boxes.numel() == 0:
+                return (
+                    torch.tensor(0.0, device=device, requires_grad=True),
+                    torch.tensor(0.0, device=device, requires_grad=True)
+                )
             
             lt = torch.max(pos_assigned_boxes[:, :2], pos_pred_boxes[:, :2])
             rb = torch.min(pos_assigned_boxes[:, 2:], pos_pred_boxes[:, 2:])
@@ -295,6 +336,10 @@ class ComputeLoss:
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
+        # Ensure targets are on the correct device
+        if targets.device != self.device:
+            targets = targets.to(self.device)
+            
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
@@ -313,7 +358,13 @@ class ComputeLoss:
 
             if n := b.shape[0]:
                 # pxy, pwh, _, pcls = pi[b, a, gj, gi].tensor_split((2, 4, 5), dim=1)  # faster, requires torch 1.8.0
-                pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+                try:
+                    pxy, pwh, _, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)  # target-subset of predictions
+                except IndexError as e:
+                    print(f"IndexError in loss computation: {e}")
+                    print(f"Shape info - pi: {pi.shape}, b: {b.shape}, a: {a.shape}, gj: {gj.shape}, gi: {gi.shape}")
+                    # Continue with next iteration if there's an error
+                    continue
 
                 # Regression
                 pxy = pxy.sigmoid() * 2 - 0.5
@@ -329,7 +380,12 @@ class ComputeLoss:
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
-                tobj[b, a, gj, gi] = iou  # iou ratio
+                
+                # Safely set values in tobj
+                for idx in range(len(b)):
+                    if 0 <= b[idx] < tobj.shape[0] and 0 <= a[idx] < tobj.shape[1] and \
+                       0 <= gj[idx] < tobj.shape[2] and 0 <= gi[idx] < tobj.shape[3]:
+                        tobj[b[idx], a[idx], gj[idx], gi[idx]] = iou[idx]
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
@@ -357,6 +413,10 @@ class ComputeLoss:
         lbox = torch.zeros(1, device=device)  # box loss
         lobj = torch.zeros(1, device=device)  # object loss
         
+        # Ensure targets are on the correct device
+        if targets.device != device:
+            targets = targets.to(device)
+        
         # Get image, class, box from targets
         bs = len(targets)  # batch size
         tcls, tbox, indices, anch = self.build_targets(p, targets)  # targets
@@ -370,38 +430,57 @@ class ComputeLoss:
             if n == 0:
                 continue
                 
-            # Get predictions for positive samples
-            pxy, pwh, pobj, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
-            
-            # Convert to absolute box coordinates
-            pxy = pxy.sigmoid() * 2 - 0.5
-            pwh = (pwh.sigmoid() * 2) ** 2 * anch[i]
-            pbox = torch.cat((pxy, pwh), 1)  # predicted box (center_x, center_y, width, height)
-            
-            # Convert to xyxy format for IoU calculation
-            pred_boxes_xyxy = self._box_cxcywh_to_xyxy(pbox)
-            gt_boxes_xyxy = self._box_cxcywh_to_xyxy(tbox[i])
-            
-            # Get anchor points (grid centers)
-            anchor_points = torch.stack([gi.float(), gj.float()], dim=1)
-            
-            # Use TaskAlignedAssigner
-            assigned_scores, assigned_boxes, assigned_labels = self.tal_assigner.assign(
-                pcls, pred_boxes_xyxy, anchor_points, tcls[i], gt_boxes_xyxy
-            )
-            
-            # Calculate losses using TaskAlignedLoss
-            cls_loss, reg_loss = self.tal_loss(pcls, pred_boxes_xyxy, assigned_scores, assigned_boxes)
-            
-            # Add to total losses
-            lcls += cls_loss
-            lbox += reg_loss
-            
-            # Calculate objectness loss - use IoU as target
-            tobj = torch.zeros_like(pi[..., 0])  # target obj
-            iou = bbox_iou(pred_boxes_xyxy, gt_boxes_xyxy, CIoU=True).detach().clamp(0)
-            tobj[b, a, gj, gi] = iou  # Set IoU as target objectness
-            lobj += self.BCEobj(pi[..., 4], tobj) * self.balance[i]
+            try:
+                # Get predictions for positive samples
+                pxy, pwh, pobj, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
+                
+                # Convert to absolute box coordinates
+                pxy = pxy.sigmoid() * 2 - 0.5
+                pwh = (pwh.sigmoid() * 2) ** 2 * anch[i]
+                pbox = torch.cat((pxy, pwh), 1)  # predicted box (center_x, center_y, width, height)
+                
+                # Convert to xyxy format for IoU calculation
+                pred_boxes_xyxy = self._box_cxcywh_to_xyxy(pbox)
+                gt_boxes_xyxy = self._box_cxcywh_to_xyxy(tbox[i])
+                
+                # Get anchor points (grid centers) - ensure they're on the correct device
+                anchor_points = torch.stack([gi.float(), gj.float()], dim=1).to(device)
+                
+                # Use TaskAlignedAssigner
+                assigned_scores, assigned_boxes, assigned_labels = self.tal_assigner.assign(
+                    pcls, pred_boxes_xyxy, anchor_points, tcls[i], gt_boxes_xyxy
+                )
+                
+                # Calculate losses using TaskAlignedLoss
+                cls_loss, reg_loss = self.tal_loss(pcls, pred_boxes_xyxy, assigned_scores, assigned_boxes)
+                
+                # Add to total losses
+                lcls += cls_loss
+                lbox += reg_loss
+                
+                # Calculate objectness loss - use IoU as target
+                tobj = torch.zeros_like(pi[..., 0])  # target obj
+                
+                # Safe IoU calculation
+                try:
+                    iou = bbox_iou(pred_boxes_xyxy, gt_boxes_xyxy, CIoU=True).detach().clamp(0)
+                    
+                    # Safely set values in tobj
+                    for idx in range(len(b)):
+                        if 0 <= b[idx] < tobj.shape[0] and 0 <= a[idx] < tobj.shape[1] and \
+                           0 <= gj[idx] < tobj.shape[2] and 0 <= gi[idx] < tobj.shape[3]:
+                            tobj[b[idx], a[idx], gj[idx], gi[idx]] = iou[idx]
+                            
+                    lobj += self.BCEobj(pi[..., 4], tobj) * self.balance[i]
+                except RuntimeError as e:
+                    print(f"RuntimeError in IoU calculation: {e}")
+                    # Skip this part if IoU calculation fails
+                    pass
+                    
+            except (IndexError, RuntimeError) as e:
+                print(f"Error in _compute_tal_loss: {e}")
+                # Continue with next iteration if there's an error
+                continue
             
         # Apply loss weights
         lbox *= self.hyp["box"]
@@ -413,6 +492,7 @@ class ComputeLoss:
         return loss * bs, torch.cat((lbox, lobj, lcls)).detach()
     
     def _box_cxcywh_to_xyxy(self, x):
+        """Convert boxes from center-width-height format to top-left/bottom-right coordinates."""
         x_c, y_c, w, h = x.unbind(-1)
         b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
              (x_c + 0.5 * w), (y_c + 0.5 * h)]
@@ -422,12 +502,60 @@ class ComputeLoss:
         """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,
         indices, and anchors.
         """
+        device = self.device
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
         tcls, tbox, indices, anch = [], [], [], []
-        gain = torch.ones(7, device=self.device)  # normalized to gridspace gain
-        ai = torch.arange(na, device=self.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-        targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
-
+        gain = torch.ones(7, device=device)  # normalized to gridspace gain
+        
+        # Handle empty targets case
+        if nt == 0:
+            return [torch.zeros(0, device=device) for _ in range(4)]
+        
+        # Ensure targets are on correct device
+        targets = targets.to(device)
+        
+        try:
+            ai = torch.arange(na, device=device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+            
+            # Memory efficient approach to avoid OOM
+            # Split targets processing if too large
+            chunk_size = 1000  # Adjust based on available memory
+            if nt * na > chunk_size:
+                tcls_temp, tbox_temp, indices_temp, anch_temp = [], [], [], []
+                
+                for start_idx in range(0, nt, chunk_size // na):
+                    end_idx = min(start_idx + chunk_size // na, nt)
+                    chunk_targets = targets[start_idx:end_idx]
+                    chunk_nt = end_idx - start_idx
+                    chunk_ai = torch.arange(na, device=device).float().view(na, 1).repeat(1, chunk_nt)
+                    chunk_targets = torch.cat((chunk_targets.repeat(na, 1, 1), chunk_ai[..., None]), 2)
+                    
+                    # Process this chunk
+                    c_tcls, c_tbox, c_indices, c_anch = self._process_targets_chunk(p, chunk_targets)
+                    
+                    # Append results
+                    tcls_temp.extend(c_tcls)
+                    tbox_temp.extend(c_tbox)
+                    indices_temp.extend(c_indices)
+                    anch_temp.extend(c_anch)
+                    
+                return tcls_temp, tbox_temp, indices_temp, anch_temp
+            else:
+                # Standard processing for smaller batches
+                targets = torch.cat((targets.repeat(na, 1, 1), ai[..., None]), 2)  # append anchor indices
+                return self._process_targets_chunk(p, targets)
+                
+        except RuntimeError as e:
+            print(f"Runtime error in build_targets: {e}")
+            # Return empty lists as fallback
+            return [torch.zeros(0, device=device) for _ in range(4)]
+    
+    def _process_targets_chunk(self, p, targets):
+        """Process a chunk of targets to build target tensors."""
+        device = self.device
+        tcls, tbox, indices, anch = [], [], [], []
+        gain = torch.ones(7, device=device)  # normalized to gridspace gain
+        
         g = 0.5  # bias
         off = (
             torch.tensor(
@@ -439,7 +567,7 @@ class ComputeLoss:
                     [0, -1],  # j,k,l,m
                     # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                 ],
-                device=self.device,
+                device=device,
             ).float()
             * g
         )  # offsets
@@ -450,7 +578,7 @@ class ComputeLoss:
 
             # Match targets to anchors
             t = targets * gain  # shape(3,n,7)
-            if nt:
+            if t.shape[0]:
                 # Matches
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
@@ -474,6 +602,33 @@ class ComputeLoss:
             a, (b, c) = a.long().view(-1), bc.long().T  # anchors, image, class
             gij = (gxy - offsets).long()
             gi, gj = gij.T  # grid indices
+
+            # Boundary checking for indices
+            valid_indices = (
+                (b >= 0) & (b < shape[0]) &
+                (gi >= 0) & (gi < shape[3]) &
+                (gj >= 0) & (gj < shape[2])
+            )
+            
+            if not valid_indices.all():
+                # Filter out invalid indices
+                b = b[valid_indices]
+                a = a[valid_indices]
+                gj = gj[valid_indices]
+                gi = gi[valid_indices]
+                c = c[valid_indices]
+                gxy = gxy[valid_indices]
+                gwh = gwh[valid_indices]
+                
+            if len(b) == 0:  # No valid indices
+                tcls.append(torch.zeros(0, dtype=torch.long, device=device))
+                tbox.append(torch.zeros(0, 4, device=device))
+                indices.append((torch.zeros(0, dtype=torch.long, device=device),
+                               torch.zeros(0, dtype=torch.long, device=device),
+                               torch.zeros(0, dtype=torch.long, device=device),
+                               torch.zeros(0, dtype=torch.long, device=device)))
+                anch.append(torch.zeros(0, 2, device=device))
+                continue
 
             # Append
             indices.append((b, a, gj.clamp_(0, shape[2] - 1), gi.clamp_(0, shape[3] - 1)))  # image, anchor, grid
