@@ -351,20 +351,20 @@ def run(
                 output = model(im)
                 if isinstance(output, tuple):
                     if len(output) == 2:  # (predictions, losses)
-                        preds, train_out = output
+                        preds = output
                     elif len(output) == 3:  # Some TOOD variants return 3 values
-                        preds, train_out = output[0], output[2]
+                        preds = output[0], output[2]
                     else:
-                        preds, train_out = output[0], None
+                        preds = output[0], None
                 else:
-                    preds, train_out = output, None
+                    preds = output, None
             else:
                 # Original YOLOv5 handling
                 output = model(im)
                 if isinstance(output, tuple) and len(output) == 2:
-                    preds, train_out = output
+                    preds = output
                 else:
-                    preds, train_out = output, None
+                    preds = output, None
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
