@@ -103,6 +103,150 @@ class QFocalLoss(nn.Module):
             return loss
 
 
+class TaskAlignedAssigner:
+    def __init__(self, topk=13, alpha=1.0, beta=6.0):
+        self.topk = topk
+        self.alpha = alpha
+        self.beta = beta
+    
+    def assign(self, 
+               pred_scores,  # (N, num_classes)
+               pred_boxes,   # (N, 4)
+               anchor_points, # (N, 2)
+               gt_labels,    # (M,)
+               gt_boxes):    # (M, 4)
+
+        num_anchors = pred_scores.shape[0]
+        num_gt = gt_boxes.shape[0]
+        
+        if num_gt == 0:
+            return (torch.zeros_like(pred_scores),
+                    torch.zeros_like(pred_boxes),
+                    torch.zeros((num_anchors,), dtype=torch.long, device=pred_scores.device))
+        
+        # Compute IoU between predictions and GT boxes
+        gt_boxes = gt_boxes[:, None, :]  # (M, 1, 4)
+        pred_boxes = pred_boxes[None, :, :]  # (1, N, 4)
+        
+        # Compute IoU
+        lt = torch.max(gt_boxes[..., :2], pred_boxes[..., :2])
+        rb = torch.min(gt_boxes[..., 2:], pred_boxes[..., 2:])
+        wh = (rb - lt).clamp(min=0)
+        overlap = wh[..., 0] * wh[..., 1]
+        
+        area_gt = (gt_boxes[..., 2] - gt_boxes[..., 0]) * (gt_boxes[..., 3] - gt_boxes[..., 1])
+        area_pred = (pred_boxes[..., 2] - pred_boxes[..., 0]) * (pred_boxes[..., 3] - pred_boxes[..., 1])
+        
+        iou = overlap / (area_gt + area_pred - overlap + 1e-7)  # (M, N)
+        
+        # Get scores for corresponding GT classes
+        gt_classes_one_hot = torch.zeros(
+            (num_gt, pred_scores.shape[1]), device=pred_scores.device, dtype=pred_scores.dtype
+        )
+        gt_classes_one_hot[torch.arange(num_gt, device=pred_scores.device), gt_labels] = 1
+        
+        # Calculate scores for each GT class
+        pred_scores = pred_scores.sigmoid()  # (N, num_classes)
+        scores = (pred_scores[None] * gt_classes_one_hot[:, None]).sum(-1)  # (M, N)
+        
+        # Compute alignment metric: score^alpha * IoU^beta
+        alignment_metric = torch.pow(scores, self.alpha) * torch.pow(iou, self.beta)  # (M, N)
+        
+        # Initialize assignment tensors
+        assigned_gt_idx = torch.full((num_anchors,), -1, dtype=torch.long, device=pred_scores.device)
+        assigned_metrics = torch.zeros((num_anchors,), device=pred_scores.device)
+        
+        # For each GT, select top-k anchors
+        for gt_idx in range(num_gt):
+            _, topk_anchor_idx = torch.topk(alignment_metric[gt_idx], min(self.topk, num_anchors), largest=True)
+            
+            # Assign based on highest metric
+            metric_gt = alignment_metric[gt_idx, topk_anchor_idx]
+            is_better = metric_gt > assigned_metrics[topk_anchor_idx]
+            assigned_gt_idx[topk_anchor_idx[is_better]] = gt_idx
+            assigned_metrics[topk_anchor_idx[is_better]] = metric_gt[is_better]
+        
+        # Create mask for positive samples
+        pos_mask = assigned_gt_idx >= 0
+        
+        # Create output tensors
+        assigned_scores = torch.zeros_like(pred_scores)
+        assigned_boxes = torch.zeros_like(pred_boxes)
+        assigned_labels = torch.zeros((num_anchors,), dtype=torch.long, device=pred_scores.device)
+        
+        if pos_mask.sum() > 0:
+            # Create one-hot labels for positive samples
+            pos_gt_labels = gt_labels[assigned_gt_idx[pos_mask]]
+            assigned_scores[pos_mask, pos_gt_labels] = 1.0
+            
+            # Assign boxes and labels
+            assigned_boxes[pos_mask] = gt_boxes.squeeze(1)[assigned_gt_idx[pos_mask]]
+            assigned_labels[pos_mask] = pos_gt_labels
+        
+        return assigned_scores, assigned_boxes, assigned_labels
+    
+
+class TaskAlignedLoss(nn.Module):
+    def __init__(self, alpha=1.0, beta=6.0, eps=1e-7):
+        super(TaskAlignedLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
+    
+    def forward(self, pred_scores, pred_boxes, assigned_scores, assigned_boxes):
+        # Create positive sample mask - sum over classes to check if any class is positive
+        pos_mask = assigned_scores.sum(dim=1) > 0
+        
+        if pos_mask.sum() == 0:
+            # No positive samples in this batch
+            return (
+                torch.tensor(0.0, device=pred_scores.device, requires_grad=True),
+                torch.tensor(0.0, device=pred_boxes.device, requires_grad=True)
+            )
+        
+        # Classification loss for all samples
+        cls_loss = self.bce(pred_scores, assigned_scores)
+        
+        # Compute alignment metric for positive samples only
+        with torch.no_grad():
+            # Get scores for assigned classes
+            assigned_labels = assigned_scores.argmax(dim=1)
+            scores = torch.sigmoid(pred_scores)
+            pos_scores = scores[pos_mask, assigned_labels[pos_mask]]
+            
+            # Compute IoU for positive samples
+            pos_pred_boxes = pred_boxes[pos_mask]
+            pos_assigned_boxes = assigned_boxes[pos_mask]
+            
+            lt = torch.max(pos_assigned_boxes[:, :2], pos_pred_boxes[:, :2])
+            rb = torch.min(pos_assigned_boxes[:, 2:], pos_pred_boxes[:, 2:])
+            wh = (rb - lt).clamp(min=0)
+            overlap = wh[:, 0] * wh[:, 1]
+            
+            area_gt = (pos_assigned_boxes[:, 2] - pos_assigned_boxes[:, 0]) * \
+                      (pos_assigned_boxes[:, 3] - pos_assigned_boxes[:, 1])
+            area_pred = (pos_pred_boxes[:, 2] - pos_pred_boxes[:, 0]) * \
+                        (pos_pred_boxes[:, 3] - pos_pred_boxes[:, 1])
+            
+            iou = overlap / (area_gt + area_pred - overlap + self.eps)
+            
+            # Alignment metric for positive samples
+            alignment_metric = torch.pow(pos_scores, self.alpha) * torch.pow(iou, self.beta)
+        
+        # Weight classification loss for positive samples only
+        pos_cls_loss = cls_loss[pos_mask].sum(dim=1) * alignment_metric
+        cls_loss = pos_cls_loss.sum() / (alignment_metric.sum() + self.eps)
+        
+        # Regression loss for positive samples only
+        reg_loss = self.smooth_l1(pos_pred_boxes, pos_assigned_boxes)
+        reg_loss = reg_loss.sum(dim=1) * alignment_metric
+        reg_loss = reg_loss.sum() / (alignment_metric.sum() + self.eps)
+        
+        return cls_loss, reg_loss
+
+
 class ComputeLoss:
     """Computes the total loss for YOLOv5 model predictions, including classification, box, and objectness losses."""
 
@@ -135,12 +279,31 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+        
+        # Initialize TaskAlignedAssigner and TaskAlignedLoss if using TOOD head
+        self.use_tal = hasattr(model, 'head_type') and model.head_type == 'TOODHead'
+        if self.use_tal:
+            self.tal_assigner = TaskAlignedAssigner(
+                topk=h.get('tal_topk', 13),
+                alpha=h.get('tal_alpha', 1.0),
+                beta=h.get('tal_beta', 6.0)
+            )
+            self.tal_loss = TaskAlignedLoss(
+                alpha=h.get('tal_alpha', 1.0),
+                beta=h.get('tal_beta', 6.0)
+            )
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
+        
+        # If using TAL for TOOD head
+        if self.use_tal:
+            return self._compute_tal_loss(p, targets)
+        
+        # Standard YOLOv5 loss computation
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
         # Losses
@@ -187,6 +350,73 @@ class ComputeLoss:
         bs = tobj.shape[0]  # batch size
 
         return (lbox + lobj + lcls) * bs, torch.cat((lbox, lobj, lcls)).detach()
+    
+    def _compute_tal_loss(self, p, targets):
+        device = self.device
+        lcls = torch.zeros(1, device=device)  # class loss
+        lbox = torch.zeros(1, device=device)  # box loss
+        lobj = torch.zeros(1, device=device)  # object loss
+        
+        # Get image, class, box from targets
+        bs = len(targets)  # batch size
+        tcls, tbox, indices, anch = self.build_targets(p, targets)  # targets
+        
+        # Process each FPN layer
+        for i, pi in enumerate(p):  # layer index, layer predictions
+            b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
+            
+            # Extract predictions
+            n = b.shape[0]  # number of targets
+            if n == 0:
+                continue
+                
+            # Get predictions for positive samples
+            pxy, pwh, pobj, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
+            
+            # Convert to absolute box coordinates
+            pxy = pxy.sigmoid() * 2 - 0.5
+            pwh = (pwh.sigmoid() * 2) ** 2 * anch[i]
+            pbox = torch.cat((pxy, pwh), 1)  # predicted box (center_x, center_y, width, height)
+            
+            # Convert to xyxy format for IoU calculation
+            pred_boxes_xyxy = self._box_cxcywh_to_xyxy(pbox)
+            gt_boxes_xyxy = self._box_cxcywh_to_xyxy(tbox[i])
+            
+            # Get anchor points (grid centers)
+            anchor_points = torch.stack([gi.float(), gj.float()], dim=1)
+            
+            # Use TaskAlignedAssigner
+            assigned_scores, assigned_boxes, assigned_labels = self.tal_assigner.assign(
+                pcls, pred_boxes_xyxy, anchor_points, tcls[i], gt_boxes_xyxy
+            )
+            
+            # Calculate losses using TaskAlignedLoss
+            cls_loss, reg_loss = self.tal_loss(pcls, pred_boxes_xyxy, assigned_scores, assigned_boxes)
+            
+            # Add to total losses
+            lcls += cls_loss
+            lbox += reg_loss
+            
+            # Calculate objectness loss - use IoU as target
+            tobj = torch.zeros_like(pi[..., 0])  # target obj
+            iou = bbox_iou(pred_boxes_xyxy, gt_boxes_xyxy, CIoU=True).detach().clamp(0)
+            tobj[b, a, gj, gi] = iou  # Set IoU as target objectness
+            lobj += self.BCEobj(pi[..., 4], tobj) * self.balance[i]
+            
+        # Apply loss weights
+        lbox *= self.hyp["box"]
+        lobj *= self.hyp["obj"]
+        lcls *= self.hyp["cls"]
+        
+        # Return total loss and component losses
+        loss = lbox + lobj + lcls
+        return loss * bs, torch.cat((lbox, lobj, lcls)).detach()
+    
+    def _box_cxcywh_to_xyxy(self, x):
+        x_c, y_c, w, h = x.unbind(-1)
+        b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+             (x_c + 0.5 * w), (y_c + 0.5 * h)]
+        return torch.stack(b, dim=-1)
 
     def build_targets(self, p, targets):
         """Prepares model targets from input targets (image,class,x,y,w,h) for loss computation, returning class, box,
