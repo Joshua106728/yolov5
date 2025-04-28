@@ -29,10 +29,10 @@ This repository is forked from the official YOLOv5 github, and changes were made
    ```
 
 ## Usage
-Train
+Train:
 !python train.py --data coco.yaml --cfg yolov5s.yaml --weights yolov5s.pt --batch-size 16 --epochs 50
 
-Validation
+Validation:
 !python data/scripts/get_coco.py --val (download MS COCO 2017 validation dataset)
 !python val.py --weights yolov5s.pt --data data/coco.yaml --img 640 --task val
 !python models/yolo.py --cfg models/yolov5s.yaml (to output some additional metrics such as FLOPs)
