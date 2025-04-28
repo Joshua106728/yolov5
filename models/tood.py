@@ -278,7 +278,7 @@ class TOODHead(nn.Module):
                 return torch.cat([out.view(out.shape[0], -1, self.no) for out in outputs], 1)
             else:
                 # Training: return all levels separately
-                return outputs if self.export else tuple(outputs)
+                return outputs
         else:
             # Single level input
             out = self.process_level(x, 0)

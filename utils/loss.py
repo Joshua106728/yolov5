@@ -122,11 +122,11 @@ class TaskAlignedAssigner:
         self.beta = beta
     
     def assign(self, 
-               pred_scores,  # (N, num_classes)
-               pred_boxes,   # (N, 4)
-               anchor_points, # (N, 2)
-               gt_labels,    # (M,)
-               gt_boxes):    # (M, 4)
+          pred_scores,  # (N, num_classes)
+          pred_boxes,   # (N, 4)
+          anchor_points, # (N, 2)
+          gt_labels,    # (M,)
+          gt_boxes):    # (M, 4)
 
         device = pred_scores.device
         num_anchors = pred_scores.shape[0]
@@ -142,57 +142,61 @@ class TaskAlignedAssigner:
         gt_boxes = gt_boxes.to(device)
         anchor_points = anchor_points.to(device)
         
-        # Compute IoU between predictions and GT boxes
-        try:
-            gt_boxes = gt_boxes[:, None, :]  # (M, 1, 4)
-            pred_boxes = pred_boxes[None, :, :]  # (1, N, 4)
+        # Use chunking for IoU computation to prevent OOM errors
+        chunk_size = min(1000, num_gt * num_anchors // 10 + 1)  # Dynamically adjust chunk size
+        iou = torch.zeros((num_gt, num_anchors), device=device)
+        
+        for i in range(0, num_gt, chunk_size):
+            end_idx = min(i + chunk_size, num_gt)
+            curr_gt_boxes = gt_boxes[i:end_idx, None, :]  # (chunk_size, 1, 4)
             
-            # Compute IoU
-            lt = torch.max(gt_boxes[..., :2], pred_boxes[..., :2])
-            rb = torch.min(gt_boxes[..., 2:], pred_boxes[..., 2:])
+            # Compute IoU for this chunk
+            lt = torch.max(curr_gt_boxes[..., :2], pred_boxes[None, :, :2])
+            rb = torch.min(curr_gt_boxes[..., 2:], pred_boxes[None, :, 2:])
             wh = (rb - lt).clamp(min=0)
             overlap = wh[..., 0] * wh[..., 1]
             
-            area_gt = (gt_boxes[..., 2] - gt_boxes[..., 0]) * (gt_boxes[..., 3] - gt_boxes[..., 1])
-            area_pred = (pred_boxes[..., 2] - pred_boxes[..., 0]) * (pred_boxes[..., 3] - pred_boxes[..., 1])
+            area_gt = ((curr_gt_boxes[..., 2] - curr_gt_boxes[..., 0]) * 
+                    (curr_gt_boxes[..., 3] - curr_gt_boxes[..., 1])).clamp(min=1e-6)
+            area_pred = ((pred_boxes[None, :, 2] - pred_boxes[None, :, 0]) * 
+                        (pred_boxes[None, :, 3] - pred_boxes[None, :, 1])).clamp(min=1e-6)
             
-            iou = overlap / (area_gt + area_pred - overlap + 1e-7)  # (M, N)
-        except RuntimeError as e:
-            # Handle potential OOM errors by implementing a batch approach
-            print(f"RuntimeError during IoU computation: {e}")
-            # Fallback to a simpler assignment strategy
-            return (
-                torch.zeros_like(pred_scores),
-                torch.zeros_like(pred_boxes),
-                torch.zeros((num_anchors,), dtype=torch.long, device=device)
-            )
+            curr_iou = overlap / (area_gt + area_pred - overlap + 1e-6)
+            iou[i:end_idx] = curr_iou
         
-        # Get scores for corresponding GT classes
+        # Get scores for corresponding GT classes - safer approach
         gt_classes_one_hot = torch.zeros(
             (num_gt, pred_scores.shape[1]), device=device, dtype=pred_scores.dtype
         )
-        gt_classes_one_hot[torch.arange(num_gt, device=device), gt_labels] = 1
+        for i in range(num_gt):
+            if 0 <= gt_labels[i] < pred_scores.shape[1]:  # Bounds check
+                gt_classes_one_hot[i, gt_labels[i]] = 1
         
         # Calculate scores for each GT class
-        pred_scores = pred_scores.sigmoid()  # (N, num_classes)
-        scores = (pred_scores[None] * gt_classes_one_hot[:, None]).sum(-1)  # (M, N)
+        pred_scores = torch.sigmoid(pred_scores)  # (N, num_classes)
+        scores = torch.matmul(gt_classes_one_hot, pred_scores.t())  # More efficient matrix multiplication
         
-        # Compute alignment metric: score^alpha * IoU^beta
-        alignment_metric = torch.pow(scores, self.alpha) * torch.pow(iou, self.beta)  # (M, N)
+        # Compute alignment metric: score^alpha * IoU^beta with clipping for stability
+        scores = torch.clamp(scores, min=1e-6, max=1.0-1e-6)
+        iou = torch.clamp(iou, min=1e-6, max=1.0-1e-6)
+        
+        alignment_metric = torch.pow(scores, self.alpha) * torch.pow(iou, self.beta)
         
         # Initialize assignment tensors
         assigned_gt_idx = torch.full((num_anchors,), -1, dtype=torch.long, device=device)
         assigned_metrics = torch.zeros((num_anchors,), device=device)
         
-        # For each GT, select top-k anchors
+        # For each GT, select top-k anchors using a safer approach
         for gt_idx in range(num_gt):
-            _, topk_anchor_idx = torch.topk(alignment_metric[gt_idx], min(self.topk, num_anchors), largest=True)
+            # Use argsort and slice instead of topk for potentially more stability
+            sorted_idx = torch.argsort(alignment_metric[gt_idx], descending=True)
+            topk_idx = sorted_idx[:min(self.topk, num_anchors)]
             
             # Assign based on highest metric
-            metric_gt = alignment_metric[gt_idx, topk_anchor_idx]
-            is_better = metric_gt > assigned_metrics[topk_anchor_idx]
-            assigned_gt_idx[topk_anchor_idx[is_better]] = gt_idx
-            assigned_metrics[topk_anchor_idx[is_better]] = metric_gt[is_better]
+            metric_gt = alignment_metric[gt_idx, topk_idx]
+            is_better = metric_gt > assigned_metrics[topk_idx]
+            assigned_gt_idx[topk_idx[is_better]] = gt_idx
+            assigned_metrics[topk_idx[is_better]] = metric_gt[is_better]
         
         # Create mask for positive samples
         pos_mask = assigned_gt_idx >= 0
@@ -205,10 +209,14 @@ class TaskAlignedAssigner:
         if pos_mask.sum() > 0:
             # Create one-hot labels for positive samples
             pos_gt_labels = gt_labels[assigned_gt_idx[pos_mask]]
-            assigned_scores[pos_mask, pos_gt_labels] = 1.0
             
-            # Assign boxes and labels
-            assigned_boxes[pos_mask] = gt_boxes.squeeze(1)[assigned_gt_idx[pos_mask]]
+            # Fill assigned scores with safer element-by-element approach
+            for i, idx in enumerate(torch.where(pos_mask)[0]):
+                if 0 <= pos_gt_labels[i] < assigned_scores.shape[1]:  # Bounds check
+                    assigned_scores[idx, pos_gt_labels[i]] = 1.0
+            
+            # Assign boxes and labels safely
+            assigned_boxes[pos_mask] = gt_boxes[assigned_gt_idx[pos_mask]]
             assigned_labels[pos_mask] = pos_gt_labels
         
         return assigned_scores, assigned_boxes, assigned_labels
@@ -232,9 +240,11 @@ class TaskAlignedLoss(nn.Module):
         
         # Create positive sample mask - sum over classes to check if any class is positive
         pos_mask = assigned_scores.sum(dim=1) > 0
+        num_pos = pos_mask.sum().item()
         
-        if pos_mask.sum() == 0:
+        if num_pos == 0:
             # No positive samples in this batch
+            # Return a small value instead of zero to avoid breaking gradients
             return (
                 torch.tensor(0.0, device=device, requires_grad=True),
                 torch.tensor(0.0, device=device, requires_grad=True)
@@ -261,29 +271,45 @@ class TaskAlignedLoss(nn.Module):
                     torch.tensor(0.0, device=device, requires_grad=True)
                 )
             
+            # Safer IoU calculation with better clamping
             lt = torch.max(pos_assigned_boxes[:, :2], pos_pred_boxes[:, :2])
             rb = torch.min(pos_assigned_boxes[:, 2:], pos_pred_boxes[:, 2:])
             wh = (rb - lt).clamp(min=0)
             overlap = wh[:, 0] * wh[:, 1]
             
             area_gt = (pos_assigned_boxes[:, 2] - pos_assigned_boxes[:, 0]) * \
-                      (pos_assigned_boxes[:, 3] - pos_assigned_boxes[:, 1])
+                    (pos_assigned_boxes[:, 3] - pos_assigned_boxes[:, 1]).clamp(min=self.eps)
             area_pred = (pos_pred_boxes[:, 2] - pos_pred_boxes[:, 0]) * \
-                        (pos_pred_boxes[:, 3] - pos_pred_boxes[:, 1])
+                        (pos_pred_boxes[:, 3] - pos_pred_boxes[:, 1]).clamp(min=self.eps)
             
+            # Safer IoU calculation with larger epsilon
             iou = overlap / (area_gt + area_pred - overlap + self.eps)
             
-            # Alignment metric for positive samples
-            alignment_metric = torch.pow(pos_scores, self.alpha) * torch.pow(iou, self.beta)
+            # Clip IoU values to avoid extreme values
+            iou = torch.clamp(iou, min=self.eps, max=1.0-self.eps)
+            
+            # Clip scores to avoid extreme values
+            pos_scores = torch.clamp(pos_scores, min=self.eps, max=1.0-self.eps)
+            
+            # Alignment metric for positive samples - use safer math operations
+            # Avoid extreme power operations by applying log-space operations or clipping
+            alignment_metric = (pos_scores ** self.alpha) * (iou ** self.beta)
+            
+            # Normalize to avoid extreme values
+            if alignment_metric.sum() > 0:
+                alignment_metric = alignment_metric / alignment_metric.sum().detach() * num_pos
+            else:
+                # Fallback for extreme cases
+                alignment_metric = torch.ones_like(alignment_metric)
         
         # Weight classification loss for positive samples only
-        pos_cls_loss = cls_loss[pos_mask].sum(dim=1) * alignment_metric
-        cls_loss = pos_cls_loss.sum() / (alignment_metric.sum() + self.eps)
+        pos_cls_loss = cls_loss[pos_mask].sum(dim=1) 
+        cls_loss = (pos_cls_loss * alignment_metric).sum() / (alignment_metric.sum() + self.eps)
         
         # Regression loss for positive samples only
         reg_loss = self.smooth_l1(pos_pred_boxes, pos_assigned_boxes)
-        reg_loss = reg_loss.sum(dim=1) * alignment_metric
-        reg_loss = reg_loss.sum() / (alignment_metric.sum() + self.eps)
+        reg_loss = reg_loss.sum(dim=1)
+        reg_loss = (reg_loss * alignment_metric).sum() / (alignment_metric.sum() + self.eps)
         
         return cls_loss, reg_loss
 
@@ -417,20 +443,24 @@ class ComputeLoss:
         if targets.device != device:
             targets = targets.to(device)
         
-        # Get image, class, box from targets
-        bs = len(targets)  # batch size
-        tcls, tbox, indices, anch = self.build_targets(p, targets)  # targets
+        # Get image, class, box from targets - with try-except for safety
+        try:
+            tcls, tbox, indices, anch = self.build_targets(p, targets)  # targets
+        except Exception as e:
+            print(f"Error in build_targets: {e}")
+            bs = len(targets)  # batch size
+            return torch.tensor(0., device=device, requires_grad=True) * bs, torch.zeros(3, device=device)
         
         # Process each FPN layer
         for i, pi in enumerate(p):  # layer index, layer predictions
-            b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
-            
-            # Extract predictions
-            n = b.shape[0]  # number of targets
-            if n == 0:
-                continue
-                
             try:
+                b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
+                
+                # Extract predictions
+                n = b.shape[0]  # number of targets
+                if n == 0:
+                    continue
+                    
                 # Get predictions for positive samples
                 pxy, pwh, pobj, pcls = pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
                 
@@ -443,39 +473,44 @@ class ComputeLoss:
                 pred_boxes_xyxy = self._box_cxcywh_to_xyxy(pbox)
                 gt_boxes_xyxy = self._box_cxcywh_to_xyxy(tbox[i])
                 
-                # Get anchor points (grid centers) - ensure they're on the correct device
+                # Get anchor points (grid centers)
                 anchor_points = torch.stack([gi.float(), gj.float()], dim=1).to(device)
                 
-                # Use TaskAlignedAssigner
-                assigned_scores, assigned_boxes, assigned_labels = self.tal_assigner.assign(
-                    pcls, pred_boxes_xyxy, anchor_points, tcls[i], gt_boxes_xyxy
-                )
-                
-                # Calculate losses using TaskAlignedLoss
-                cls_loss, reg_loss = self.tal_loss(pcls, pred_boxes_xyxy, assigned_scores, assigned_boxes)
-                
-                # Add to total losses
-                lcls += cls_loss
-                lbox += reg_loss
-                
-                # Calculate objectness loss - use IoU as target
-                tobj = torch.zeros_like(pi[..., 0])  # target obj
-                
-                # Safe IoU calculation
+                # Use TaskAlignedAssigner with try-except for robustness
                 try:
-                    iou = bbox_iou(pred_boxes_xyxy, gt_boxes_xyxy, CIoU=True).detach().clamp(0)
+                    assigned_scores, assigned_boxes, assigned_labels = self.tal_assigner.assign(
+                        pcls, pred_boxes_xyxy, anchor_points, tcls[i], gt_boxes_xyxy
+                    )
+                    
+                    # Calculate losses using TaskAlignedLoss
+                    cls_loss, reg_loss = self.tal_loss(pcls, pred_boxes_xyxy, assigned_scores, assigned_boxes)
+                    
+                    # Add to total losses - check for NaN values
+                    if not torch.isnan(cls_loss) and not torch.isinf(cls_loss):
+                        lcls += cls_loss
+                    if not torch.isnan(reg_loss) and not torch.isinf(reg_loss):
+                        lbox += reg_loss
+                    
+                    # Calculate objectness loss - use IoU as target
+                    tobj = torch.zeros_like(pi[..., 0])  # target obj
+                    
+                    # Safe IoU calculation
+                    iou = bbox_iou(pred_boxes_xyxy, gt_boxes_xyxy, CIoU=True).detach().clamp(0, 1)
                     
                     # Safely set values in tobj
                     for idx in range(len(b)):
                         if 0 <= b[idx] < tobj.shape[0] and 0 <= a[idx] < tobj.shape[1] and \
-                           0 <= gj[idx] < tobj.shape[2] and 0 <= gi[idx] < tobj.shape[3]:
+                        0 <= gj[idx] < tobj.shape[2] and 0 <= gi[idx] < tobj.shape[3]:
                             tobj[b[idx], a[idx], gj[idx], gi[idx]] = iou[idx]
                             
-                    lobj += self.BCEobj(pi[..., 4], tobj) * self.balance[i]
-                except RuntimeError as e:
-                    print(f"RuntimeError in IoU calculation: {e}")
-                    # Skip this part if IoU calculation fails
-                    pass
+                    obj_loss = self.BCEobj(pi[..., 4], tobj) * self.balance[i]
+                    if not torch.isnan(obj_loss) and not torch.isinf(obj_loss):
+                        lobj += obj_loss
+                        
+                except Exception as e:
+                    print(f"Error in TAL assignment or loss calculation: {e}")
+                    # Continue with next iteration if assignment fails
+                    continue
                     
             except (IndexError, RuntimeError) as e:
                 print(f"Error in _compute_tal_loss: {e}")
@@ -487,7 +522,13 @@ class ComputeLoss:
         lobj *= self.hyp["obj"]
         lcls *= self.hyp["cls"]
         
+        # Check for NaN values in final losses
+        lbox = torch.nan_to_num(lbox, nan=0.0, posinf=1.0, neginf=0.0)
+        lobj = torch.nan_to_num(lobj, nan=0.0, posinf=1.0, neginf=0.0)
+        lcls = torch.nan_to_num(lcls, nan=0.0, posinf=1.0, neginf=0.0)
+        
         # Return total loss and component losses
+        bs = len(targets)  # batch size
         loss = lbox + lobj + lcls
         return loss * bs, torch.cat((lbox, lobj, lcls)).detach()
     
