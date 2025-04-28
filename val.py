@@ -338,16 +338,41 @@ def run(
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            if hasattr(model, 'head_type') and model.head_type == 'TOODHead':
+                # TOOD models return predictions differently
+                preds = model(im)[0] if compute_loss else model(im, augment=augment)[0]
+            else:
+                preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            if hasattr(model, 'head_type') and model.head_type == 'TOODHead':
+                # TOOD may return losses differently
+                output = model(im)
+                if isinstance(output, tuple):
+                    if len(output) == 2:  # (predictions, losses)
+                        preds, train_out = output
+                    elif len(output) == 3:  # Some TOOD variants return 3 values
+                        preds, train_out = output[0], output[2]
+                    else:
+                        preds, train_out = output[0], None
+                else:
+                    preds, train_out = output, None
+            else:
+                # Original YOLOv5 handling
+                output = model(im)
+                if isinstance(output, tuple) and len(output) == 2:
+                    preds, train_out = output
+                else:
+                    preds, train_out = output, None
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         with dt[2]:
+            if hasattr(model, 'head_type') and model.head_type == 'TOODHead':
+                # TOOD may need different confidence thresholds
+                conf_thres = max(conf_thres, 0.01)  # TOOD tends to have lower confidence scores
             preds = non_max_suppression(
                 preds, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, max_det=max_det
             )
@@ -378,6 +403,9 @@ def run(
                 tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                if hasattr(model, 'head_type') and model.head_type == 'TOODHead':
+                    # For TOOD, we might want to adjust the IoU thresholds
+                    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # standard COCO thresholds
                 correct = process_batch(predn, labelsn, iouv)
                 if plots:
                     confusion_matrix.process_batch(predn, labelsn)
